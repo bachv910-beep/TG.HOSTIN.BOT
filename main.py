@@ -123,7 +123,17 @@ COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
     ["📦 Manual Install", "👤 My Info"],
     ["📞 Contact Owner"]
 ]
-# pending_scripts and pending_zips tables removed - auto approval enabled
+ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
+    ["📢 Updates Channel"],
+    ["📤 Upload File", "📂 Check Files"],
+    ["⚡ Bot Speed", "📊 Statistics"],
+    ["💳 Subscriptions", "📢 Broadcast"],
+    ["🔒 Lock Bot", "🟢 Run All Code"],
+    ["👥 User Management", "📋 Pending Files"],
+    ["👑 Admin Panel", "🛠️ Manual Install"],
+    ["📢 Channel Add", "👤 My Info"],
+    ["📞 Contact Owner"]
+]
 
 # ============================================================
 # --- Database Setup ---
@@ -169,7 +179,15 @@ def init_db():
                      (key TEXT PRIMARY KEY, value TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS force_join_channels
                      (channel TEXT PRIMARY KEY, title TEXT, invite_link TEXT, added_by INTEGER, added_at TEXT)''')
-        # pending_scripts and pending_zips tables removed - auto approval enabled
+        c.execute('''CREATE TABLE IF NOT EXISTS pending_scripts
+                     (user_id INTEGER, project_name TEXT, file_path TEXT, file_type TEXT,
+                      is_safe INTEGER, security_msg TEXT, chat_id INTEGER, main_file TEXT,
+                      queued_at TEXT,
+                      PRIMARY KEY (user_id, project_name))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS pending_zips
+                     (user_id INTEGER, project_name TEXT, zip_path TEXT, file_name_zip TEXT,
+                      main_file TEXT, patterns TEXT, queued_at TEXT,
+                      PRIMARY KEY (user_id, project_name))''')
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
             c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
@@ -220,8 +238,44 @@ def load_data():
             ]
             logger.info(f"Loaded {len(force_join_channels)} force-join channel(s).")
         except Exception: pass
-        # Approval system removed - files are now auto-approved
-        logger.info("Approval system disabled. Files will be auto-saved on upload.")
+        # Load pending script files
+        try:
+            import json as _json
+            c.execute('SELECT user_id, project_name, file_path, file_type, is_safe, security_msg, chat_id, main_file FROM pending_scripts')
+            for uid, pname, fpath, ftype, is_safe, sec_msg, chat_id, main_file in c.fetchall():
+                if not os.path.exists(fpath):
+                    logger.warning(f"Pending script file missing on disk, skipping: {fpath}")
+                    continue
+                if uid not in pending_script_files:
+                    pending_script_files[uid] = {}
+                pending_script_files[uid][pname] = {
+                    'path': fpath, 'type': ftype, 'is_safe': bool(is_safe),
+                    'security_msg': sec_msg or '', 'chat_id': chat_id,
+                    'project_name': pname, 'main_file': main_file or pname,
+                }
+            logger.info(f"Loaded {sum(len(v) for v in pending_script_files.values())} pending script(s) from DB.")
+        except Exception as e:
+            logger.warning(f"Could not load pending_scripts: {e}")
+        # Load pending zip files
+        try:
+            c.execute('SELECT user_id, project_name, zip_path, file_name_zip, main_file, patterns FROM pending_zips')
+            for uid, pname, zip_path, fname_zip, main_file, patterns_json in c.fetchall():
+                if not os.path.exists(zip_path):
+                    logger.warning(f"Pending zip file missing on disk, skipping: {zip_path}")
+                    continue
+                with open(zip_path, 'rb') as zf:
+                    file_content = zf.read()
+                patterns = _json.loads(patterns_json) if patterns_json else []
+                if uid not in pending_zip_files:
+                    pending_zip_files[uid] = {}
+                pending_zip_files[uid][pname] = {
+                    'content': file_content, 'patterns': patterns,
+                    'file_name_zip': fname_zip or f"{pname}.zip",
+                    'project_name': pname, 'main_file': main_file,
+                }
+            logger.info(f"Loaded {sum(len(v) for v in pending_zip_files.values())} pending zip(s) from DB.")
+        except Exception as e:
+            logger.warning(f"Could not load pending_zips: {e}")
         conn.close()
         logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subs, {len(admin_ids)} admins, {len(banned_users)} banned.")
     except Exception as e:
@@ -2792,72 +2846,55 @@ def _finalize_upload(message, user_id):
     project_folder = get_user_folder(user_id, project_name)
 
     if file_ext == '.zip':
-        # Auto-process ZIP: keep the security scan, but remove admin approval.
+        # Pass project_name and optional main_file into zip processing
         threading.Thread(
-            target=_process_zip_without_approval,
+            target=_queue_zip_for_approval,
             args=(file_content, file_name, user_id, project_name, main_file, message)
         ).start()
     else:
-        # Single script file: scan first, then auto-start when safe.
+        # Single script file
         file_path = os.path.join(project_folder, file_name)
         with open(file_path, 'wb') as f: f.write(file_content)
         is_safe, security_msg = check_code_security(file_path, file_ext.lstrip('.'))
 
+        if user_id not in pending_script_files: pending_script_files[user_id] = {}
+        pending_script_files[user_id][project_name] = {
+            'path': file_path, 'type': file_ext.lstrip('.'),
+            'is_safe': is_safe, 'security_msg': security_msg,
+            'chat_id': chat_id, 'project_name': project_name,
+            'main_file': file_name,
+        }
+        save_pending_script_db(user_id, project_name, pending_script_files[user_id][project_name])
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton("✅ Approve", callback_data=f"approve_file_{user_id}_{project_name}"),
+            types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_file_{user_id}_{project_name}")
+        )
+        markup.row(types.InlineKeyboardButton("📋 View in Pending Files", callback_data=f"pending_user_{user_id}"))
         if not is_safe:
             try:
-                os.remove(file_path)
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as _fscan:
+                    _content = _fscan.read()
+                found_patterns = [p for p in DANGEROUS_PATTERNS if re.search(p, _content, re.IGNORECASE)]
+                pattern_lines = '\n'.join(f"  ⚠️ `{p}`" for p in found_patterns[:10])
+                if len(found_patterns) > 10:
+                    pattern_lines += f"\n  ... and `{len(found_patterns) - 10}` more"
+                danger_detail = f"🚨 *Dangerous Patterns Found:* `{len(found_patterns)}`\n{pattern_lines}"
             except Exception:
-                pass
-            bot.send_message(chat_id,
-                f"❌ Project `{project_name}` blocked by security scan.\n{security_msg}",
-                parse_mode='Markdown')
-            return
-
-        try:
-            if file_ext == '.js':
-                handle_js_file(file_path, user_id, project_folder, file_name, message, project_name)
-            elif file_ext == '.py':
-                handle_py_file(file_path, user_id, project_folder, file_name, message, project_name)
-            else:
-                bot.send_message(chat_id, f"❌ Unsupported file type: `{file_ext}`", parse_mode='Markdown')
-                return
-            bot.send_message(chat_id,
-                f"✅ Project `{project_name}` uploaded and started automatically.",
-                parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Error auto-starting project {project_name}: {e}", exc_info=True)
-            bot.send_message(chat_id, f"❌ Error starting project: `{md_escape(e)}`", parse_mode='Markdown')
-
-
-def _process_zip_without_approval(file_content, file_name_zip, user_id, project_name, main_file, message):
-    """Scan ZIP and start it automatically when it passes the security scan."""
-    temp_dir = None
-    try:
-        temp_dir = tempfile.mkdtemp(prefix=f"user_{user_id}_zip_")
-        zip_path = os.path.join(temp_dir, file_name_zip)
-        with open(zip_path, 'wb') as f: f.write(file_content)
-
-        is_safe, security_msg = scan_zip_security(zip_path)
-        if not is_safe:
-            bot.send_message(message.chat.id,
-                f"❌ Project `{project_name}` blocked by security scan.\n{security_msg}",
-                parse_mode='Markdown')
-            return
-
-        process_zip_file(file_content, file_name_zip, user_id, get_user_folder(user_id, project_name),
-                         message, project_name, main_file)
-        bot.send_message(message.chat.id,
-            f"✅ Project `{project_name}` uploaded and started automatically.",
-            parse_mode='Markdown')
-    except zipfile.BadZipFile:
-        bot.send_message(message.chat.id, "❌ Invalid/corrupted ZIP file.")
-    except Exception as e:
-        logger.error(f"Error auto-processing ZIP for {user_id}: {e}", exc_info=True)
-        bot.send_message(message.chat.id, f"❌ Error processing ZIP: `{md_escape(e)}`", parse_mode='Markdown')
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            try: shutil.rmtree(temp_dir)
+                danger_detail = f"🚨 *Security Issue:* `{security_msg}`"
+        else:
+            danger_detail = "✅ *Security:* No dangerous patterns detected"
+        warning = (f"🔔 *New File Upload — Review Required*\n\n"
+                   f"👤 User: `{user_id}`\n"
+                   f"📦 Project: `{project_name}`\n"
+                   f"📁 File: `{file_name}` (`.{file_ext.lstrip('.')}`)\n\n"
+                   f"{danger_detail}")
+        for aid in admin_ids:
+            try: bot.send_message(aid, warning, reply_markup=markup, parse_mode='Markdown')
             except Exception: pass
+        bot.send_message(chat_id,
+            f"✅ Project `{project_name}` queued for review. You'll be notified upon approval.",
+            parse_mode='Markdown')
 
 
 def _queue_zip_for_approval(file_content, file_name_zip, user_id, project_name, main_file, message):
